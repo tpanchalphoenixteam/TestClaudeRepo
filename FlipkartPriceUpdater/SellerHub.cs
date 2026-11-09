@@ -216,29 +216,84 @@ public sealed class SellerHub : IAsyncDisposable
         }
     }
 
+    public const int MaxAttempts = 3;
+
+    /// <summary>Sidebar "Listings" (hover opens a menu) -> "My Listings". Retries, then asks you.</summary>
     public async Task<ILocator> OpenListingsPageAsync()
     {
-        // 1) the way you'd do it by hand: Listings -> My Listings
-        _log("Opening Listings -> My Listings...");
-        if (await ClickTextAsync("Listings"))
+        for (var attempt = 1; attempt <= MaxAttempts; attempt++)
         {
-            await ClickTextAsync("My Listings", "Manage Listings", "Active Listings", "Listings Management");
-            await Page.WaitForTimeoutAsync(2500);
-            if (await FindSkuSearchAsync() is { } box) return Remember(box);
+            _log(attempt == 1 ? "Opening Listings -> My Listings..." : $"Opening My Listings again (try {attempt}/{MaxAttempts})...");
+            try
+            {
+                if (await OpenMyListingsFromMenuAsync() && await WaitForSkuSearchAsync() is { } box)
+                    return Remember(box);
+            }
+            catch (PlaywrightException ex)
+            {
+                _log("    " + FirstLine(ex.Message));
+            }
+            // something went wrong: reload the Seller Hub tab and try again
+            try { await Page.ReloadAsync(new() { WaitUntil = WaitUntilState.DOMContentLoaded }); } catch (PlaywrightException) { }
+            await Page.WaitForTimeoutAsync(2000);
         }
 
-        // 2) known direct links
+        // known direct links as a last automatic attempt
         foreach (var url in ListingPages)
         {
-            await Page.GotoAsync(url, new() { WaitUntil = WaitUntilState.DOMContentLoaded });
-            await Page.WaitForTimeoutAsync(3000);
-            if (await FindSkuSearchAsync() is { } box2) return Remember(box2);
+            try
+            {
+                await Page.GotoAsync(url, new() { WaitUntil = WaitUntilState.DOMContentLoaded });
+                if (await WaitForSkuSearchAsync() is { } box2) return Remember(box2);
+            }
+            catch (PlaywrightException) { }
         }
 
-        // 3) ask the user
         await _askUser("I couldn't open My Listings automatically.\n\n" +
-                       "In the Flipkart tab, click Listings -> My Listings (the page with the SKU search box), then click OK here.");
-        return Remember(await FindSkuSearchAsync() ?? throw new InvalidOperationException("SKU search box not found on this page"));
+                       "In the Flipkart tab, hover Listings (left menu) and click My Listings, then click OK here.");
+        return Remember(await WaitForSkuSearchAsync() ?? throw new InvalidOperationException("Search box not found on My Listings"));
+    }
+
+    async Task<bool> OpenMyListingsFromMenuAsync()
+    {
+        var myListingsRx = new Regex(@"^\s*My Listings\s*$", I);
+        // The sidebar "Listings" opens a flyout menu on hover (My Listings / Add New Listings / ...).
+        var sidebar = await FirstVisibleAsync(
+            Page.GetByRole(AriaRole.Link, new() { NameRegex = new Regex(@"^\s*Listings\s*$", I) }),
+            Page.GetByRole(AriaRole.Button, new() { NameRegex = new Regex(@"^\s*Listings\s*$", I) }),
+            Page.GetByText(new Regex(@"^\s*Listings\s*$", I)));
+        if (sidebar is not null)
+        {
+            await sidebar.HoverAsync();
+            await Page.WaitForTimeoutAsync(800);
+        }
+
+        var item = await FirstVisibleAsync(
+            Page.GetByRole(AriaRole.Link, new() { NameRegex = myListingsRx }),
+            Page.GetByRole(AriaRole.Menuitem, new() { NameRegex = myListingsRx }),
+            Page.GetByText(myListingsRx));
+        if (item is null && sidebar is not null)
+        {
+            await sidebar.ClickAsync();           // some layouts open the menu on click
+            await Page.WaitForTimeoutAsync(1000);
+            item = await FirstVisibleAsync(Page.GetByRole(AriaRole.Link, new() { NameRegex = myListingsRx }), Page.GetByText(myListingsRx));
+        }
+        if (item is null) return false;
+
+        await item.ClickAsync();
+        try { await Page.WaitForLoadStateAsync(LoadState.NetworkIdle, new() { Timeout = 10_000 }); } catch (PlaywrightException) { }
+        await Page.WaitForTimeoutAsync(1500);
+        return true;
+    }
+
+    async Task<ILocator?> WaitForSkuSearchAsync()
+    {
+        for (var i = 0; i < 10; i++)
+        {
+            if (await FindSkuSearchAsync() is { } box) return box;
+            await Page.WaitForTimeoutAsync(1000);
+        }
+        return null;
     }
 
     string? _listingsUrl;
@@ -253,13 +308,23 @@ public sealed class SellerHub : IAsyncDisposable
     /// <summary>Updates one SKU and sets <see cref="PriceChange.Status"/>. Never throws.</summary>
     public async Task UpdateAsync(PriceChange change)
     {
-        try
+        for (var attempt = 1; attempt <= MaxAttempts; attempt++)
         {
-            change.Status = await UpdateCoreAsync(change);
-        }
-        catch (Exception ex)
-        {
-            change.Status = $"FAILED - {ex.GetType().Name}: {FirstLine(ex.Message)}";
+            try
+            {
+                change.Status = await UpdateCoreAsync(change);
+            }
+            catch (Exception ex)
+            {
+                change.Status = $"FAILED - {ex.GetType().Name}: {FirstLine(ex.Message)}";
+            }
+            if (change.Succeeded) break;
+            if (attempt < MaxAttempts)
+            {
+                _log($"    {change.Status} -> retrying ({attempt + 1}/{MaxAttempts})");
+                _listingsUrl = null;   // forces a fresh Listings -> My Listings before the next try
+                await Page.WaitForTimeoutAsync(2000);
+            }
         }
 
         if (!change.Succeeded)
@@ -277,26 +342,42 @@ public sealed class SellerHub : IAsyncDisposable
 
     async Task<string> UpdateCoreAsync(PriceChange c)
     {
-        // Only reuse the search box if we're still on My Listings (the home page has a different "Search LID" box).
+        // Always search from My Listings (reuse it if we're still there).
         var search = Page.Url == _listingsUrl ? await FindSkuSearchAsync() : null;
         search ??= await OpenListingsPageAsync();
+        await search.ClickAsync();
         await search.FillAsync("");
         await search.FillAsync(c.Sku);
+        await Page.WaitForTimeoutAsync(800);
         await search.PressAsync("Enter");
         await Page.WaitForTimeoutAsync(2500);
 
         ILocator? row = null;
-        for (var i = 0; i < 6 && row is null; i++)
+        for (var i = 0; i < 8 && row is null; i++)
         {
             row = await FindSkuRowAsync(c.Sku);
+            if (row is null && i == 2)
+            {
+                // The search may show a suggestion list instead of filtering: click the matching suggestion.
+                var suggestion = await FirstVisibleAsync(
+                    Page.GetByRole(AriaRole.Option).Filter(new() { HasTextRegex = new Regex(Regex.Escape(c.Sku), I) }),
+                    Page.Locator("li, [class*=suggest i] *").Filter(new() { HasTextRegex = new Regex(Regex.Escape(c.Sku), I) }));
+                if (suggestion is not null) await suggestion.ClickAsync();
+            }
             if (row is null) await Page.WaitForTimeoutAsync(1000);
         }
-        if (row is null) return "FAILED - SKU not found in listings";
+        if (row is null) return "FAILED - SKU not found in My Listings";
 
-        // A) price editable directly in the listings table
-        var priceInput = await FirstVisibleAsync(
-            row.GetByLabel(new Regex("selling price|your price|price", I)),
-            row.Locator("input[name*=price i], input[id*=price i], input[placeholder*=price i]"));
+        // A) price editable directly in the listings table (possibly after clicking a pencil icon)
+        var priceInput = await FindRowPriceInputAsync(row);
+        if (priceInput is null &&
+            await FirstVisibleAsync(row.Locator("[class*=pencil i], [class*=edit-price i], [class*=editPrice i], [aria-label*=price i][role=button]")) is { } pencil)
+        {
+            await pencil.ClickAsync();
+            await Page.WaitForTimeoutAsync(800);
+            priceInput = await FindRowPriceInputAsync(row) ?? await FirstVisibleAsync(
+                Page.Locator("[role=dialog] input[name*=price i], [role=dialog] input[id*=price i], [role=dialog] input[type=number]"));
+        }
 
         if (priceInput is not null)
         {
@@ -329,7 +410,10 @@ public sealed class SellerHub : IAsyncDisposable
         }
 
         await Page.WaitForTimeoutAsync(500);
-        ILocator scope = priceInput is not null ? row : Page.Locator("body");
+        // Save button: in the row, in a popup, or on the page
+        ILocator scope = priceInput is not null
+            ? (await Page.Locator("[role=dialog]").CountAsync() > 0 ? Page.Locator("[role=dialog]").Last : row)
+            : Page.Locator("body");
         var saved = false;
         foreach (var name in SaveButtons)
         {
@@ -352,10 +436,17 @@ public sealed class SellerHub : IAsyncDisposable
     }
 
     // ------------------------------------------------------------------ helpers
+    /// <summary>The search box on My Listings - Flipkart's top "Search LID" bar (also takes SKU IDs).</summary>
     Task<ILocator?> FindSkuSearchAsync() => FirstVisibleAsync(
         Page.GetByPlaceholder(new Regex("sku", I)),
-        Page.GetByPlaceholder(new Regex("search", I)),
-        Page.Locator("input[type=search]"));
+        Page.GetByPlaceholder(new Regex("search|LID", I)),
+        Page.GetByRole(AriaRole.Searchbox),
+        Page.Locator("input[type=search]"),
+        Page.Locator("[class*=search i] input:not([type=hidden]), input[class*=search i]"));
+
+    static Task<ILocator?> FindRowPriceInputAsync(ILocator row) => FirstVisibleAsync(
+        row.GetByLabel(new Regex("selling price|your price|price", I)),
+        row.Locator("input[name*=price i], input[id*=price i], input[placeholder*=price i]"));
 
     /// <summary>Find the element showing exactly this SKU, then climb to its table row / card.</summary>
     async Task<ILocator?> FindSkuRowAsync(string sku)

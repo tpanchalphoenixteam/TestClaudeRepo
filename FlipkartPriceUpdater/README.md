@@ -36,8 +36,9 @@ It does not open a new browser and you don't log in again.
 1. Have Seller Hub open in Chrome as usual.
 2. Fill the grid: **SKU ID**, **Selling Price**, optional **MRP**. Or copy the columns from Excel and press **Ctrl+V** in the grid.
 3. Click **OK - Update Prices**. **Chrome asks to allow the connection: click Allow.**
-4. The app finds your Seller Hub tab and, for each SKU, goes **Listings → My Listings**, searches the SKU ID,
-   changes the price and clicks Save.
+4. The app finds your Seller Hub tab and, for each SKU, hovers **Listings → My Listings**, types the SKU ID into
+   the top **Search LID** box, changes the price (clicking the pencil icon if there is one) and clicks Save.
+   If anything goes wrong it reopens My Listings and tries again, up to 3 times per SKU.
 5. Each row's **Status** column turns green (OK), orange (CHECK = please verify in the browser) or red (FAILED).
    A screenshot of every problem is saved in the `logs` folder next to the app
    (`bin\Debug\net8.0-windows\logs` when run from Visual Studio). Chrome and your tabs stay open.
