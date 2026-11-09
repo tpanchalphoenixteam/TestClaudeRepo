@@ -18,10 +18,7 @@ public sealed class SellerHub : IAsyncDisposable
         "https://seller.flipkart.com/index.html#dashboard/listings-management",
         "https://seller.flipkart.com/index.html#dashboard/my-listings",
     };
-    static readonly string[] SaveButtons = { "Save", "Update", "Save Changes", "Update Price", "Submit", "Done" };
-    static readonly string[] PriceLabels = { "Your selling price", "Selling Price", "Your Selling Price (INR)" };
     static readonly Regex SuccessRx = new("success|updated|saved|submitted", I);
-    const string ControlSelector = "input:not([type=hidden]):not([type=file]), select, textarea, [role=combobox]";
 
     readonly Func<string, Task> _askUser;
     readonly Action<string> _log;
@@ -318,9 +315,10 @@ public sealed class SellerHub : IAsyncDisposable
             {
                 change.Status = $"FAILED - {ex.GetType().Name}: {FirstLine(ex.Message)}";
             }
-            if (change.Succeeded) break;
+            if (!change.Status.StartsWith("FAILED", StringComparison.Ordinal)) break;   // OK or CHECK: don't redo
             if (attempt < MaxAttempts)
             {
+                try { await Page.Keyboard.PressAsync("Escape"); } catch (PlaywrightException) { }
                 _log($"    {change.Status} -> retrying ({attempt + 1}/{MaxAttempts})");
                 _listingsUrl = null;   // forces a fresh Listings -> My Listings before the next try
                 await Page.WaitForTimeoutAsync(2000);
@@ -340,113 +338,261 @@ public sealed class SellerHub : IAsyncDisposable
         }
     }
 
+    /// <summary>Which control in the "Price &amp; Settlement" box is used to change the price.</summary>
+    public PriceMethod Method { get; set; } = PriceMethod.EditPencil;
+
+    static readonly Regex SaveRx = new(@"^\s*(save|update|submit|confirm|done|update price|save changes|save price)\s*$", I);
+    static readonly Regex ConfirmRx = new(@"^\s*(yes|confirm|proceed|continue|yes,? update|ok)\s*$", I);
+
     async Task<string> UpdateCoreAsync(PriceChange c)
     {
-        // Always search from My Listings (reuse it if we're still there).
+        var row = await SearchSkuAsync(c.Sku);
+        if (row is null) return "FAILED - SKU not found in My Listings";
+
+        var box = await FindPriceBoxAsync(row);
+        if (box is null) return "FAILED - 'Price & Settlement' box not found for this SKU";
+
+        // Mark the inputs that exist now, so we can spot the price box that the click opens.
+        await Page.EvaluateAsync("() => document.querySelectorAll('input,textarea').forEach(e => e.setAttribute('data-fpu-old', '1'))");
+
+        var pencil = Method == PriceMethod.EditPencil;
+        var error = pencil ? await ClickPencilAsync(box) : await ClickArrowAsync(box);
+        if (error is not null) return error;
+        await Page.WaitForTimeoutAsync(1200);
+
+        var wanted = pencil ? new Regex(@"listing price|selling price|your price|\bprice\b", I)
+                            : new Regex(@"bank settlement|settlement", I);
+        var input = await FindNewInputAsync(wanted, requireMatch: false);
+        if (input is null)
+            return $"FAILED - no price box appeared after clicking {(pencil ? "Edit (pencil)" : "the > arrow")}";
+
+        await input.ClickAsync();
+        await input.FillAsync("");
+        await input.FillAsync(c.Price);
+        if (c.Mrp is not null && await FindNewInputAsync(new Regex(@"\bmrp\b", I), requireMatch: true) is { } mrp)
+            await mrp.FillAsync(c.Mrp);
+        await Page.WaitForTimeoutAsync(400);
+
+        var clickedSave = await ClickSaveNearAsync(input);
+        if (!clickedSave) await input.PressAsync("Enter");   // some inline editors save on Enter
+        await Page.WaitForTimeoutAsync(1200);
+        await ClickConfirmIfAskedAsync();
+        await Page.WaitForTimeoutAsync(1500);
+
+        // Verify: the row's Price & Settlement box now shows the new price.
+        if (await RowShowsPriceAsync(c.Sku, c.Price, pencil)) return $"OK - updated, row now shows Rs.{c.Price}";
+        if (await FirstVisibleAsync(Page.Locator("[class*=error i], [role=alert]")) is { } err &&
+            (await err.InnerTextAsync()).Trim().Length > 0)
+            return $"CHECK - Flipkart said: {FirstLine(await err.InnerTextAsync())}";
+        if (!clickedSave) return "CHECK - price typed, but no Save/Update button found (save it in the browser)";
+        if (await FirstVisibleAsync(Page.GetByText(SuccessRx)) is not null) return "OK - updated (Flipkart showed a success message)";
+        return $"CHECK - saved, but the row doesn't show Rs.{c.Price} yet (Flipkart may need a few minutes - please verify)";
+    }
+
+    /// <summary>Type the SKU in the top search panel ("This Page") and return the result row.</summary>
+    async Task<ILocator?> SearchSkuAsync(string sku)
+    {
         var search = Page.Url == _listingsUrl ? await FindSkuSearchAsync() : null;
         search ??= await OpenListingsPageAsync();
         await search.ClickAsync();
-        await search.FillAsync("");
-        await search.FillAsync(c.Sku);
-        await Page.WaitForTimeoutAsync(800);
-        await search.PressAsync("Enter");
+        await Page.WaitForTimeoutAsync(700);
+
+        // Clicking opens a panel with "This Page | All Pages" and its own input.
+        ILocator? box = null;
+        var thisPage = await FirstVisibleAsync(
+            Page.GetByRole(AriaRole.Button, new() { NameRegex = new Regex(@"^\s*This Page\s*$", I) }),
+            Page.GetByRole(AriaRole.Tab, new() { NameRegex = new Regex(@"^\s*This Page\s*$", I) }),
+            Page.GetByText(new Regex(@"^\s*This Page\s*$", I)));
+        if (thisPage is not null)
+        {
+            await thisPage.ClickAsync();
+            await Page.WaitForTimeoutAsync(300);
+            box = await FirstVisibleAsync(thisPage.Locator("xpath=ancestor::*[.//input][1]").Locator("input:not([type=hidden]):not([type=checkbox])"));
+        }
+        box ??= await FirstVisibleAsync(Page.Locator("input:focus")) ?? await FindSkuSearchAsync() ?? search;
+
+        await box.ClickAsync();
+        await box.FillAsync("");
+        await box.FillAsync(sku);
+        await Page.WaitForTimeoutAsync(700);
+        await box.PressAsync("Enter");
         await Page.WaitForTimeoutAsync(2500);
 
-        ILocator? row = null;
-        for (var i = 0; i < 8 && row is null; i++)
+        for (var i = 0; i < 8; i++)
         {
-            row = await FindSkuRowAsync(c.Sku);
-            if (row is null && i == 2)
+            if (await FindSkuRowAsync(sku) is { } row) return row;
+            if (i == 2)
             {
-                // The search may show a suggestion list instead of filtering: click the matching suggestion.
+                // If the search only shows a suggestion ("Search for ..."), click it.
                 var suggestion = await FirstVisibleAsync(
-                    Page.GetByRole(AriaRole.Option).Filter(new() { HasTextRegex = new Regex(Regex.Escape(c.Sku), I) }),
-                    Page.Locator("li, [class*=suggest i] *").Filter(new() { HasTextRegex = new Regex(Regex.Escape(c.Sku), I) }));
+                    Page.GetByRole(AriaRole.Option).Filter(new() { HasTextRegex = new Regex(Regex.Escape(sku[..Math.Min(sku.Length, 15)]), I) }),
+                    Page.GetByText(new Regex(@"^\s*Search for\b", I)));
                 if (suggestion is not null) await suggestion.ClickAsync();
             }
-            if (row is null) await Page.WaitForTimeoutAsync(1000);
+            await Page.WaitForTimeoutAsync(1000);
         }
-        if (row is null) return "FAILED - SKU not found in My Listings";
+        return null;
+    }
 
-        // A) price editable directly in the listings table (possibly after clicking a pencil icon)
-        var priceInput = await FindRowPriceInputAsync(row);
-        if (priceInput is null &&
-            await FirstVisibleAsync(row.Locator("[class*=pencil i], [class*=edit-price i], [class*=editPrice i], [aria-label*=price i][role=button]")) is { } pencil)
+    /// <summary>The "Price &amp; Settlement" box of a row ("Listing: Rs.373 ... Final: Rs.373 ...").</summary>
+    static async Task<ILocator?> FindPriceBoxAsync(ILocator row)
+    {
+        var lines = row.Locator("div, td, section")
+            .Filter(new() { HasTextRegex = new Regex(@"Listing\s*:?\s*₹", I) })
+            .Filter(new() { HasTextRegex = new Regex(@"Final\s*:?\s*₹", I) });
+        var n = await lines.CountAsync();
+        if (n == 0) return null;
+        // The deepest match holds just the two price lines; its parent also holds the pencil and the > arrow.
+        return lines.Nth(n - 1).Locator("xpath=..");
+    }
+
+    async Task<string?> ClickPencilAsync(ILocator box)
+    {
+        await box.HoverAsync();                // the pencil only appears while hovering the box
+        await Page.WaitForTimeoutAsync(600);
+        var labelled = await FirstVisibleAsync(
+            box.GetByRole(AriaRole.Button, new() { NameRegex = new Regex(@"^\s*edit", I) }),
+            box.Locator("[title='Edit' i], [aria-label*=edit i], [data-tooltip*=edit i], [class*=pencil i], [class*=edit i]"));
+        if (labelled is not null)
         {
-            await pencil.ClickAsync();
-            await Page.WaitForTimeoutAsync(800);
-            priceInput = await FindRowPriceInputAsync(row) ?? await FirstVisibleAsync(
-                Page.Locator("[role=dialog] input[name*=price i], [role=dialog] input[id*=price i], [role=dialog] input[type=number]"));
+            await labelled.ClickAsync();
+            return null;
         }
 
-        if (priceInput is not null)
+        // Unlabelled icons: hover each one and click the one that shows the "Edit" tooltip.
+        var editTip = Page.GetByText(new Regex(@"^\s*Edit\s*$", I));
+        var icons = box.Locator("svg, img, button, [role=button]");
+        var n = Math.Min(await icons.CountAsync(), 15);
+        for (var i = 0; i < n; i++)
         {
-            await priceInput.FillAsync(c.Price);
-            if (c.Mrp is not null &&
-                await FirstVisibleAsync(row.Locator("input[name*=mrp i], input[id*=mrp i], input[placeholder*=mrp i]")) is { } mrpInput)
+            var icon = icons.Nth(i);
+            if (!await icon.IsVisibleAsync()) continue;
+            var before = await CountVisibleAsync(editTip);
+            await icon.HoverAsync();
+            await Page.WaitForTimeoutAsync(400);
+            if (await CountVisibleAsync(editTip) > before)
             {
-                await mrpInput.FillAsync(c.Mrp);
+                await icon.ClickAsync();
+                return null;
             }
-            await priceInput.PressAsync("Tab");
         }
-        else
-        {
-            // B) open the listing editor from the row
-            var edit = await FirstVisibleAsync(
-                row.GetByRole(AriaRole.Button, new() { NameRegex = new Regex(@"^\s*edit", I) }),
-                row.GetByRole(AriaRole.Link, new() { NameRegex = new Regex(@"^\s*edit", I) }),
-                row.GetByText(new Regex(@"^\s*edit\s*(price|listing)?\s*$", I)),
-                row.Locator("[title*=edit i], [aria-label*=edit i]"));
-            if (edit is null) return "FAILED - no price box or Edit button for this SKU";
-            await edit.ClickAsync();
-            await Page.WaitForTimeoutAsync(3000);
-            await ClickTextAsync("Price, Stock and Shipping Information", "Price, Stock and Shipping", "Price");
+        return "FAILED - pencil (Edit) icon not found in the Price & Settlement box";
+    }
 
-            if (c.Mrp is not null && !await SetValueAsync("MRP", c.Mrp)) return "FAILED - MRP field not found";
-            var priceSet = false;
-            foreach (var label in PriceLabels)
-                if (priceSet = await SetValueAsync(label, c.Price)) break;
-            if (!priceSet) return "FAILED - selling price field not found";
+    async Task<string?> ClickArrowAsync(ILocator box)
+    {
+        await box.HoverAsync();
+        await Page.WaitForTimeoutAsync(400);
+        var arrow = await FirstVisibleAsync(box.Locator("[class*=arrow i], [class*=chevron i], [aria-label*=detail i], [aria-label*=more i]"));
+        if (arrow is null)
+        {
+            var svgs = box.Locator("svg");          // the > arrow is the right-most icon in the box
+            for (var i = await svgs.CountAsync() - 1; i >= 0 && arrow is null; i--)
+                if (await svgs.Nth(i).IsVisibleAsync()) arrow = svgs.Nth(i);
         }
+        await (arrow ?? box).ClickAsync();
+        return null;
+    }
 
-        await Page.WaitForTimeoutAsync(500);
-        // Save button: in the row, in a popup, or on the page
-        ILocator scope = priceInput is not null
-            ? (await Page.Locator("[role=dialog]").CountAsync() > 0 ? Page.Locator("[role=dialog]").Last : row)
-            : Page.Locator("body");
-        var saved = false;
-        foreach (var name in SaveButtons)
+    /// <summary>A visible input that appeared after the click; prefers one whose label matches <paramref name="wanted"/>.</summary>
+    async Task<ILocator?> FindNewInputAsync(Regex wanted, bool requireMatch)
+    {
+        const string labelJs = @"e => {
+            let t = [e.getAttribute('aria-label'), e.placeholder, e.name, e.id].filter(Boolean).join(' ');
+            if (e.labels) for (const l of e.labels) t += ' ' + l.innerText;
+            for (let p = e.parentElement, i = 0; p && i < 4; p = p.parentElement, i++) {
+                const txt = (p.innerText || '').trim();
+                if (txt) { t += ' ' + txt.slice(0, 120); break; }
+            }
+            return t; }";
+        var inputs = Page.Locator("input:not([data-fpu-old]):not([type=hidden]):not([type=checkbox]):not([type=radio]):not([type=file]), textarea:not([data-fpu-old])");
+        for (var attempt = 0; attempt < 5; attempt++)
         {
-            var btn = await FirstVisibleAsync(scope.GetByRole(AriaRole.Button,
-                new() { NameRegex = new Regex($@"^\s*{Regex.Escape(name)}\s*$", I) }));
+            ILocator? fallback = null;
+            var n = Math.Min(await inputs.CountAsync(), 20);
+            for (var i = 0; i < n; i++)
+            {
+                var el = inputs.Nth(i);
+                if (!await el.IsVisibleAsync() || !await el.IsEditableAsync()) continue;
+                if (wanted.IsMatch(await el.EvaluateAsync<string>(labelJs))) return el;
+                fallback ??= el;
+            }
+            if (fallback is not null && !requireMatch) return fallback;
+            await Page.WaitForTimeoutAsync(800);
+        }
+        return null;
+    }
+
+    /// <summary>Clicks the Save/Update button closest to the input (popup, drawer or inline editor).</summary>
+    async Task<bool> ClickSaveNearAsync(ILocator input)
+    {
+        var ancestors = input.Locator("xpath=ancestor::*[.//button or .//*[@role='button']]");
+        var n = await ancestors.CountAsync();
+        for (var i = n - 1; i >= Math.Max(0, n - 8); i--)      // nearest container first
+        {
+            var btn = await FirstVisibleAsync(ancestors.Nth(i).GetByRole(AriaRole.Button, new() { NameRegex = SaveRx }));
             if (btn is not null && await btn.IsEnabledAsync())
             {
                 await btn.ClickAsync();
-                saved = true;
-                break;
+                return true;
             }
         }
-        if (!saved) return "CHECK - price typed, but no Save/Update button found (save it in the browser)";
+        return false;
+    }
 
-        await Page.WaitForTimeoutAsync(2500);
-        if (await FirstVisibleAsync(Page.GetByText(SuccessRx)) is not null) return "OK - updated";
-        if (await FirstVisibleAsync(Page.Locator("[class*=error i], [role=alert]")) is { } err)
-            return $"CHECK - Flipkart said: {FirstLine(await err.InnerTextAsync())}";
-        return "OK - saved (no confirmation message seen, please spot-check)";
+    async Task ClickConfirmIfAskedAsync()
+    {
+        var dialogs = Page.Locator("[role=dialog], [role=alertdialog], [class*=modal i]");
+        var btn = await FirstVisibleAsync(dialogs.GetByRole(AriaRole.Button, new() { NameRegex = ConfirmRx }));
+        if (btn is not null)
+        {
+            await btn.ClickAsync();
+            await Page.WaitForTimeoutAsync(1000);
+        }
+    }
+
+    async Task<bool> RowShowsPriceAsync(string sku, string price, bool listingPrice)
+    {
+        var p = decimal.Parse(price, System.Globalization.CultureInfo.InvariantCulture).ToString("0.##", System.Globalization.CultureInfo.InvariantCulture);
+        var rx = new Regex((listingPrice ? @"Listing:?₹" : "₹") + Regex.Escape(p) + @"(?![\d.])");
+        for (var i = 0; i < 4; i++)
+        {
+            if (await FindSkuRowAsync(sku) is { } row && await FindPriceBoxAsync(row) is { } box)
+            {
+                var text = Regex.Replace(await box.InnerTextAsync(), @"[\s,]", "");
+                if (rx.IsMatch(text)) return true;
+            }
+            await Page.WaitForTimeoutAsync(1000);
+        }
+        return false;
+    }
+
+    static async Task<int> CountVisibleAsync(ILocator loc)
+    {
+        var count = 0;
+        var n = Math.Min(await loc.CountAsync(), 20);
+        for (var i = 0; i < n; i++)
+            if (await loc.Nth(i).IsVisibleAsync()) count++;
+        return count;
     }
 
     // ------------------------------------------------------------------ helpers
     /// <summary>The search box on My Listings - Flipkart's top "Search LID" bar (also takes SKU IDs).</summary>
-    Task<ILocator?> FindSkuSearchAsync() => FirstVisibleAsync(
-        Page.GetByPlaceholder(new Regex("sku", I)),
-        Page.GetByPlaceholder(new Regex("search|LID", I)),
-        Page.GetByRole(AriaRole.Searchbox),
-        Page.Locator("input[type=search]"),
-        Page.Locator("[class*=search i] input:not([type=hidden]), input[class*=search i]"));
+    async Task<ILocator?> FindSkuSearchAsync()
+    {
+        var found = await FirstVisibleAsync(
+            Page.GetByPlaceholder(new Regex("sku", I)),
+            Page.GetByPlaceholder(new Regex("search|LID", I)),
+            Page.GetByRole(AriaRole.Searchbox),
+            Page.Locator("input[type=search]"),
+            Page.Locator("[class*=search i] input:not([type=hidden]), input[class*=search i]"));
+        if (found is not null) return found;
 
-    static Task<ILocator?> FindRowPriceInputAsync(ILocator row) => FirstVisibleAsync(
-        row.GetByLabel(new Regex("selling price|your price|price", I)),
-        row.Locator("input[name*=price i], input[id*=price i], input[placeholder*=price i]"));
+        // The "Search LID" label may be text drawn over the box rather than a placeholder.
+        var label = await FirstVisibleAsync(Page.GetByText(new Regex(@"^\s*Search\s*(LID|SKU|FSN)?\s*$", I)));
+        return label is null ? null : await FirstVisibleAsync(
+            label.Locator("xpath=ancestor::*[.//input][1]").Locator("input:not([type=hidden]):not([type=checkbox])"));
+    }
 
     /// <summary>Find the element showing exactly this SKU, then climb to its table row / card.</summary>
     async Task<ILocator?> FindSkuRowAsync(string sku)
@@ -458,7 +604,13 @@ public sealed class SellerHub : IAsyncDisposable
         var row = cell.Locator("xpath=ancestor::*[self::tr or @role='row'][1]");
         if (await row.CountAsync() > 0) return row.First;
 
-        for (var up = 1; up < 8; up++)   // div-based layouts
+        // div-based layouts (Seller Hub): climb until the container also holds the "Listing: Rs..." price box
+        for (var up = 1; up < 10; up++)
+        {
+            var ancestor = cell.Locator("xpath=" + string.Join("/", Enumerable.Repeat("..", up)));
+            if (await ancestor.GetByText(new Regex(@"Listing\s*:?\s*₹", I)).CountAsync() > 0) return ancestor;
+        }
+        for (var up = 1; up < 8; up++)   // other layouts: nearest container with a control
         {
             var ancestor = cell.Locator("xpath=" + string.Join("/", Enumerable.Repeat("..", up)));
             if (await ancestor.Locator("button, input:not([type=hidden]), a").CountAsync() > 0) return ancestor;
@@ -479,82 +631,6 @@ public sealed class SellerHub : IAsyncDisposable
             }
         }
         return null;
-    }
-
-    async Task<bool> ClickTextAsync(params string[] texts)
-    {
-        foreach (var t in texts)
-        {
-            var rx = new Regex($@"^\s*{Regex.Escape(t)}\s*$", I);
-            var loc = await FirstVisibleAsync(
-                Page.GetByRole(AriaRole.Button, new() { NameRegex = rx }),
-                Page.GetByRole(AriaRole.Link, new() { NameRegex = rx }),
-                Page.GetByRole(AriaRole.Tab, new() { NameRegex = rx }),
-                Page.GetByText(rx));
-            if (loc is null) continue;
-            try
-            {
-                await loc.ClickAsync(new() { Timeout = 4000 });
-                await Page.WaitForTimeoutAsync(800);
-                return true;
-            }
-            catch (PlaywrightException) { }
-        }
-        return false;
-    }
-
-    /// <summary>Find the input/select/textarea that belongs to a visible label.</summary>
-    async Task<ILocator?> FindFieldAsync(string label)
-    {
-        var rx = new Regex($@"^\s*{Regex.Escape(label)}\s*\*?\s*(\(.*\))?\s*:?\s*$", I);
-        var direct = await FirstVisibleAsync(Page.GetByLabel(rx), Page.GetByPlaceholder(new Regex(Regex.Escape(label), I)));
-        if (direct is not null) return direct;
-
-        var labelEl = await FirstVisibleAsync(Page.GetByText(rx));
-        if (labelEl is null) return null;
-
-        // Walk up; stop at the first container holding exactly one control.
-        for (var up = 1; up < 4; up++)
-        {
-            var controls = labelEl.Locator("xpath=" + string.Join("/", Enumerable.Repeat("..", up))).Locator(ControlSelector);
-            var n = await controls.CountAsync();
-            if (n == 1) return controls.First;
-            if (n > 1) break;
-        }
-        var next = labelEl.Locator("xpath=following::*[self::input[not(@type='hidden') and not(@type='file')]" +
-                                   " or self::select or self::textarea or @role='combobox'][1]");
-        return await next.CountAsync() > 0 ? next : null;
-    }
-
-    async Task<bool> SetValueAsync(string label, string value)
-    {
-        var ctl = await FindFieldAsync(label);
-        if (ctl is null) return false;
-        try
-        {
-            await ctl.ScrollIntoViewIfNeededAsync();
-            var tag = await ctl.EvaluateAsync<string>("e => e.tagName.toLowerCase()");
-            if (tag == "select")
-            {
-                var options = await ctl.Locator("option").AllInnerTextsAsync();
-                var match = options.FirstOrDefault(o => o.Trim().Equals(value, StringComparison.OrdinalIgnoreCase))
-                            ?? options.FirstOrDefault(o => o.Contains(value, StringComparison.OrdinalIgnoreCase))
-                            ?? value;
-                await ctl.SelectOptionAsync(new SelectOptionValue { Label = match });
-            }
-            else
-            {
-                await ctl.FillAsync("");
-                await ctl.FillAsync(value);
-                await ctl.PressAsync("Tab");
-            }
-            _log($"    {label} = {value}");
-            return true;
-        }
-        catch (PlaywrightException)
-        {
-            return false;
-        }
     }
 
     static string FirstLine(string s)

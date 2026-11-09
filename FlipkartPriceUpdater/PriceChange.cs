@@ -10,3 +10,12 @@ public sealed class PriceChange
     public string Status { get; set; } = "pending";
     public bool Succeeded => Status.StartsWith("OK", StringComparison.Ordinal);
 }
+
+/// <summary>How the price is changed on My Listings.</summary>
+public enum PriceMethod
+{
+    /// <summary>Pencil (Edit) icon in the "Price &amp; Settlement" box: enter the listing (selling) price.</summary>
+    EditPencil,
+    /// <summary>The ">" arrow in the "Price &amp; Settlement" box: enter the bank settlement amount.</summary>
+    BankSettlementArrow,
+}

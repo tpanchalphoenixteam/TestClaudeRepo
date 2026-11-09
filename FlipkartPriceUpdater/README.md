@@ -36,9 +36,14 @@ It does not open a new browser and you don't log in again.
 1. Have Seller Hub open in Chrome as usual.
 2. Fill the grid: **SKU ID**, **Selling Price**, optional **MRP**. Or copy the columns from Excel and press **Ctrl+V** in the grid.
 3. Click **OK - Update Prices**. **Chrome asks to allow the connection: click Allow.**
-4. The app finds your Seller Hub tab and, for each SKU, hovers **Listings → My Listings**, types the SKU ID into
-   the top **Search LID** box, changes the price (clicking the pencil icon if there is one) and clicks Save.
-   If anything goes wrong it reopens My Listings and tries again, up to 3 times per SKU.
+4. The app finds your Seller Hub tab and, for each SKU:
+   - hovers **Listings → My Listings**,
+   - types the SKU ID into the top search panel (**This Page**) and presses Enter,
+   - in the result row's **Price & Settlement** box, uses the method chosen in **"Change price using"**:
+     - **Edit (pencil)**: clicks the pencil (it appears when you hover the box) and enters the **selling (listing) price**, or
+     - **Arrow (>)**: clicks the arrow and enters the **Bank Settlement** amount,
+   - clicks Save/Update (and Confirm if Flipkart asks), then checks that the row now shows the new ₹ price.
+   If a step fails it reopens My Listings and tries again, up to 3 times per SKU.
 5. Each row's **Status** column turns green (OK), orange (CHECK = please verify in the browser) or red (FAILED).
    A screenshot of every problem is saved in the `logs` folder next to the app
    (`bin\Debug\net8.0-windows\logs` when run from Visual Studio). Chrome and your tabs stay open.

@@ -11,6 +11,7 @@ public sealed class MainForm : Form
     readonly Button _clear = new() { Text = "Clear", AutoSize = true, Padding = new Padding(10, 4, 10, 4) };
     readonly Button _setup = new() { Text = "Connect my Chrome (one-time setup)", AutoSize = true, Padding = new Padding(10, 4, 10, 4) };
     readonly CheckBox _attach = new() { Text = "Use my open Chrome (Flipkart tab)", Checked = true, AutoSize = true };
+    readonly ComboBox _method = new() { DropDownStyle = ComboBoxStyle.DropDownList, Width = 430 };
     bool _running;
 
     public MainForm()
@@ -25,7 +26,7 @@ public sealed class MainForm : Form
         {
             AutoSize = true,
             Padding = new Padding(0, 0, 0, 6),
-            Text = "Enter one SKU per row with its new selling price (MRP is optional).\n" +
+            Text = "Enter one SKU per row with its new price (MRP is optional).\n" +
                    "Tip: copy SKU / Price columns from Excel and press Ctrl+V in the grid.",
         };
 
@@ -63,7 +64,21 @@ public sealed class MainForm : Form
         layout.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
         layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 130));
         layout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
-        layout.Controls.Add(help, 0, 0);
+        _method.Items.AddRange(new object[]
+        {
+            "Edit (pencil) in Price & Settlement  ->  enter Selling (listing) price",
+            "Arrow (>) in Price & Settlement  ->  enter Bank Settlement amount",
+        });
+        _method.SelectedIndex = 0;
+        _method.SelectedIndexChanged += (_, _) =>
+            _grid.Columns[ColPrice].HeaderText = _method.SelectedIndex == 0 ? "Selling Price" : "Bank Settlement";
+        var methodRow = new FlowLayoutPanel { AutoSize = true, WrapContents = false, Margin = new Padding(0, 0, 0, 6) };
+        methodRow.Controls.Add(new Label { Text = "Change price using:", AutoSize = true, Margin = new Padding(0, 6, 6, 0) });
+        methodRow.Controls.Add(_method);
+        var top = new FlowLayoutPanel { AutoSize = true, FlowDirection = FlowDirection.TopDown, WrapContents = false, Dock = DockStyle.Fill };
+        top.Controls.Add(help);
+        top.Controls.Add(methodRow);
+        layout.Controls.Add(top, 0, 0);
         layout.Controls.Add(_grid, 0, 1);
         layout.Controls.Add(_log, 0, 2);
         layout.Controls.Add(buttons, 0, 3);
@@ -130,7 +145,10 @@ public sealed class MainForm : Form
         foreach (var c in changes) SetStatus(c, "waiting...", Color.DimGray);
         try
         {
-            await using var hub = new SellerHub(AskUserAsync, Log);
+            await using var hub = new SellerHub(AskUserAsync, Log)
+            {
+                Method = _method.SelectedIndex == 0 ? PriceMethod.EditPencil : PriceMethod.BankSettlementArrow,
+            };
             if (_attach.Checked)
             {
                 Log("Looking for your open Chrome / Flipkart tab...");
@@ -221,7 +239,7 @@ public sealed class MainForm : Form
     void SetRunning(bool running)
     {
         _running = running;
-        _ok.Enabled = _clear.Enabled = _attach.Enabled = _setup.Enabled = !running;
+        _ok.Enabled = _clear.Enabled = _attach.Enabled = _setup.Enabled = _method.Enabled = !running;
         _grid.ReadOnly = running;
         _grid.AllowUserToAddRows = !running;
         UseWaitCursor = running;
