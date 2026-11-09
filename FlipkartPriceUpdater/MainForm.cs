@@ -69,9 +69,9 @@ public sealed class MainForm : Form
             "Edit (pencil) in Price & Settlement  ->  enter Selling (listing) price",
             "Arrow (>) in Price & Settlement  ->  enter Bank Settlement amount",
         });
-        _method.SelectedIndex = 0;
         _method.SelectedIndexChanged += (_, _) =>
             _grid.Columns[ColPrice].HeaderText = _method.SelectedIndex == 0 ? "Selling Price" : "Bank Settlement";
+        _method.SelectedIndex = 1;   // Bank Settlement via the > arrow (the way shown in the Seller Hub video)
         var methodRow = new FlowLayoutPanel { AutoSize = true, WrapContents = false, Margin = new Padding(0, 0, 0, 6) };
         methodRow.Controls.Add(new Label { Text = "Change price using:", AutoSize = true, Margin = new Padding(0, 6, 6, 0) });
         methodRow.Controls.Add(_method);

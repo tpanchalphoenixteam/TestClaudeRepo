@@ -13,12 +13,16 @@ public sealed class SellerHub : IAsyncDisposable
     const RegexOptions I = RegexOptions.IgnoreCase;
 
     // "Manage listings" pages; the first one that shows a SKU search box is used.
-    static readonly string[] ListingPages =
+    /// <summary>My Listings (Active). Searching adds &amp;listingsSearchQuery=...&amp;partnerContext=ALL (seen in Seller Hub).</summary>
+    public string MyListingsUrl { get; init; } = "https://seller.flipkart.com/index.html#dashboard/listings-management?listingState=ACTIVE";
+
+    string[] ListingPages => new[]
     {
+        MyListingsUrl,
         "https://seller.flipkart.com/index.html#dashboard/listings-management",
-        "https://seller.flipkart.com/index.html#dashboard/my-listings",
     };
     static readonly Regex SuccessRx = new("success|updated|saved|submitted", I);
+    static readonly Regex ErrorRx = new(@"error|failed|unable|cannot|can't|not allowed|limit|exceed|invalid|try again", I);
 
     readonly Func<string, Task> _askUser;
     readonly Action<string> _log;
@@ -318,7 +322,7 @@ public sealed class SellerHub : IAsyncDisposable
             if (!change.Status.StartsWith("FAILED", StringComparison.Ordinal)) break;   // OK or CHECK: don't redo
             if (attempt < MaxAttempts)
             {
-                try { await Page.Keyboard.PressAsync("Escape"); } catch (PlaywrightException) { }
+                await ClosePanelAsync();
                 _log($"    {change.Status} -> retrying ({attempt + 1}/{MaxAttempts})");
                 _listingsUrl = null;   // forces a fresh Listings -> My Listings before the next try
                 await Page.WaitForTimeoutAsync(2000);
@@ -346,11 +350,13 @@ public sealed class SellerHub : IAsyncDisposable
 
     async Task<string> UpdateCoreAsync(PriceChange c)
     {
+        await ClosePanelAsync();   // a Listing Details panel left open would cover the list
         var row = await SearchSkuAsync(c.Sku);
         if (row is null) return "FAILED - SKU not found in My Listings";
 
         var box = await FindPriceBoxAsync(row);
         if (box is null) return "FAILED - 'Price & Settlement' box not found for this SKU";
+        if (Method == PriceMethod.BankSettlementArrow) return await UpdateBankSettlementAsync(c, box);
 
         // Mark the inputs that exist now, so we can spot the price box that the click opens.
         await Page.EvaluateAsync("() => document.querySelectorAll('input,textarea').forEach(e => e.setAttribute('data-fpu-old', '1'))");
@@ -389,9 +395,151 @@ public sealed class SellerHub : IAsyncDisposable
         return $"CHECK - saved, but the row doesn't show Rs.{c.Price} yet (Flipkart may need a few minutes - please verify)";
     }
 
+    /// <summary>
+    /// The &gt; arrow opens "Listing Details" (Settlement &amp; Price tab). In "Settlement to Price Calculator" type the
+    /// Bank Settlement, then click "Apply Rs.X as Settlement". Flipkart answers "Values updated successfully...
+    /// may take upto 30-45 mins", and the page keeps showing the old value until then.
+    /// Settlement can only be increased 2 times a day, so this never clicks Apply twice.
+    /// </summary>
+    async Task<string> UpdateBankSettlementAsync(PriceChange c, ILocator box)
+    {
+        await Page.EvaluateAsync("() => document.querySelectorAll('input,textarea').forEach(e => e.setAttribute('data-fpu-old', '1'))");
+        await ClickArrowAsync(box);
+
+        // Wait for the panel to finish loading (it shows a grey skeleton first).
+        var input = await FindNewInputAsync(new Regex(@"bank settlement", I), requireMatch: true);
+        if (input is null)
+        {
+            await ClosePanelAsync();
+            return "FAILED - 'Bank Settlement' box didn't appear after clicking the > arrow";
+        }
+
+        var target = decimal.Parse(c.Price, System.Globalization.CultureInfo.InvariantCulture);
+        var current = await ReadCurrentSettlementAsync();
+        if (current == target)
+        {
+            await ClosePanelAsync();
+            return $"OK - Bank Settlement is already Rs.{c.Price}, nothing to change";
+        }
+
+        await input.ClickAsync();
+        await input.FillAsync("");
+        await input.FillAsync(c.Price);
+        await input.PressAsync("Tab");
+
+        // The button text follows the box: "Apply Rs.271 as Settlement". Make sure it shows our amount.
+        var applyRx = new Regex(@"^\s*Apply\s*₹?\s*([\d,]+(\.\d+)?)\s*as\s*Settlement\s*$", I);
+        ILocator? apply = null;
+        for (var i = 0; i < 10 && apply is null; i++)
+        {
+            var btn = await FirstVisibleAsync(Page.GetByRole(AriaRole.Button, new() { NameRegex = applyRx }));
+            if (btn is not null)
+            {
+                var m = applyRx.Match(await btn.InnerTextAsync());
+                if (m.Success && decimal.Parse(m.Groups[1].Value.Replace(",", ""), System.Globalization.CultureInfo.InvariantCulture) == target
+                    && await btn.IsEnabledAsync())
+                    apply = btn;
+            }
+            if (apply is null) await Page.WaitForTimeoutAsync(500);
+        }
+        if (apply is null)
+        {
+            var msg = await VisibleMessageAsync(ErrorRx);
+            await ClosePanelAsync();
+            return msg is not null
+                ? $"FAILED - Flipkart said: {msg}"
+                : $"FAILED - 'Apply Rs.{c.Price} as Settlement' button not found or disabled";
+        }
+
+        // From here on: Apply is clicked once, never retried (2 increases per day limit).
+        await apply.ClickAsync();
+        string result;
+        try
+        {
+            result = $"CHECK - clicked 'Apply Rs.{c.Price} as Settlement' but saw no reply from Flipkart (please verify)";
+            for (var i = 0; i < 20; i++)
+            {
+                await Page.WaitForTimeoutAsync(500);
+                if (await VisibleMessageAsync(new Regex(@"updated successfully|success", I)) is { } ok)
+                {
+                    result = $"OK - Bank Settlement set to Rs.{c.Price} (Flipkart: {FirstLine(ok)})";
+                    break;
+                }
+                if (await VisibleMessageAsync(ErrorRx) is { } err)
+                {
+                    result = $"CHECK - Flipkart said: {err}";
+                    break;
+                }
+                await ClickConfirmIfAskedAsync();
+            }
+            await ClosePanelAsync();
+        }
+        catch (Exception ex)
+        {
+            result = $"CHECK - Apply was clicked, then: {FirstLine(ex.Message)} (please verify)";
+        }
+        return result;
+    }
+
+    /// <summary>"Current Pricing  Bank Settlement: Rs.269  Listing Price: Rs.373" at the top of the panel.</summary>
+    async Task<decimal?> ReadCurrentSettlementAsync()
+    {
+        var el = await FirstVisibleAsync(Page.GetByText(new Regex(@"^\s*Bank Settlement\s*:\s*₹\s*[\d,.]+\s*$", I)));
+        if (el is null) return null;
+        var m = Regex.Match(await el.InnerTextAsync(), @"₹\s*([\d,]+(\.\d+)?)");
+        return m.Success ? decimal.Parse(m.Groups[1].Value.Replace(",", ""), System.Globalization.CultureInfo.InvariantCulture) : null;
+    }
+
+    /// <summary>Text of a visible toast / alert / message matching the pattern.</summary>
+    async Task<string?> VisibleMessageAsync(Regex rx)
+    {
+        var el = await FirstVisibleAsync(
+            Page.Locator("[role=alert], [role=status], [class*=toast i], [class*=snackbar i], [class*=notification i], [class*=message i]")
+                .Filter(new() { HasTextRegex = rx }),
+            Page.GetByText(new Regex(@"Values updated successfully", I)));
+        if (el is null) return null;
+        var text = FirstLine(await el.InnerTextAsync());
+        return rx.IsMatch(text) ? text : null;
+    }
+
+    async Task ClosePanelAsync()
+    {
+        try
+        {
+            var header = await FirstVisibleAsync(Page.GetByText(new Regex(@"^\s*Listing Details\s*$", I)));
+            if (header is null) return;   // no panel open
+            var close = await FirstVisibleAsync(
+                header.Locator("xpath=ancestor::*[.//button or .//*[@role='button'] or .//svg][1]")
+                      .Locator("button[aria-label*=close i], [aria-label*=close i], button:has(svg), [role=button]:has(svg)"));
+            if (close is not null) await close.ClickAsync();
+            else await Page.Keyboard.PressAsync("Escape");
+            await Page.WaitForTimeoutAsync(800);
+        }
+        catch (PlaywrightException) { }
+    }
+
     /// <summary>Type the SKU in the top search panel ("This Page") and return the result row.</summary>
     async Task<ILocator?> SearchSkuAsync(string sku)
     {
+        // 1) Open the same address Seller Hub shows after a search (fast and reliable).
+        var url = $"{MyListingsUrl}&listingsSearchQuery={Uri.EscapeDataString(sku)}&partnerContext=ALL";
+        try
+        {
+            await Page.GotoAsync(url, new() { WaitUntil = WaitUntilState.DOMContentLoaded });
+            for (var i = 0; i < 15; i++)
+            {
+                await Page.WaitForTimeoutAsync(1000);
+                if (await FindSkuRowAsync(sku) is { } found) return found;
+            }
+            _log("    search link didn't show the SKU - using the search box instead");
+        }
+        catch (PlaywrightException ex)
+        {
+            _log("    " + FirstLine(ex.Message));
+        }
+        _listingsUrl = null;
+
+        // 2) Type it in the top search panel, like you do by hand.
         var search = Page.Url == _listingsUrl ? await FindSkuSearchAsync() : null;
         search ??= await OpenListingsPageAsync();
         await search.ClickAsync();
@@ -500,13 +648,14 @@ public sealed class SellerHub : IAsyncDisposable
         const string labelJs = @"e => {
             let t = [e.getAttribute('aria-label'), e.placeholder, e.name, e.id].filter(Boolean).join(' ');
             if (e.labels) for (const l of e.labels) t += ' ' + l.innerText;
-            for (let p = e.parentElement, i = 0; p && i < 4; p = p.parentElement, i++) {
+            // nearest ancestor with real words (wrappers that only hold a Rs. sign or digits are skipped)
+            for (let p = e.parentElement, i = 0; p && i < 6; p = p.parentElement, i++) {
                 const txt = (p.innerText || '').trim();
-                if (txt) { t += ' ' + txt.slice(0, 120); break; }
+                if (/[A-Za-z]{3,}/.test(txt)) { t += ' ' + txt.slice(0, 160); break; }
             }
             return t; }";
         var inputs = Page.Locator("input:not([data-fpu-old]):not([type=hidden]):not([type=checkbox]):not([type=radio]):not([type=file]), textarea:not([data-fpu-old])");
-        for (var attempt = 0; attempt < 5; attempt++)
+        for (var attempt = 0; attempt < 15; attempt++)
         {
             ILocator? fallback = null;
             var n = Math.Min(await inputs.CountAsync(), 20);

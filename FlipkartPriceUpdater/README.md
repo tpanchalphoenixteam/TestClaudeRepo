@@ -37,13 +37,17 @@ It does not open a new browser and you don't log in again.
 2. Fill the grid: **SKU ID**, **Selling Price**, optional **MRP**. Or copy the columns from Excel and press **Ctrl+V** in the grid.
 3. Click **OK - Update Prices**. **Chrome asks to allow the connection: click Allow.**
 4. The app finds your Seller Hub tab and, for each SKU:
-   - hovers **Listings → My Listings**,
-   - types the SKU ID into the top search panel (**This Page**) and presses Enter,
+   - opens **My Listings** searched for that SKU (the same address Seller Hub shows after a search;
+     if that doesn't work it hovers **Listings → My Listings** and types the SKU in the top search panel),
    - in the result row's **Price & Settlement** box, uses the method chosen in **"Change price using"**:
-     - **Edit (pencil)**: clicks the pencil (it appears when you hover the box) and enters the **selling (listing) price**, or
-     - **Arrow (>)**: clicks the arrow and enters the **Bank Settlement** amount,
-   - clicks Save/Update (and Confirm if Flipkart asks), then checks that the row now shows the new ₹ price.
-   If a step fails it reopens My Listings and tries again, up to 3 times per SKU.
+     - **Arrow (>) – Bank Settlement** (default): opens **Listing Details → Settlement & Price**, types the amount in
+       **Bank Settlement** in the *Settlement to Price Calculator*, and clicks **"Apply ₹X as Settlement"**.
+       Success = Flipkart's *"Values updated successfully… may take upto 30-45 mins"* message
+       (the page keeps showing the old value until then). If the settlement is already that amount, nothing is clicked.
+       **Apply is never clicked twice for a SKU**, because Flipkart allows only 2 settlement increases per day.
+     - **Edit (pencil)**: clicks the pencil (it appears when you hover the box) and enters the selling (listing) price,
+   - closes the Listing Details panel.
+   Steps before the final Apply/Save are retried up to 3 times per SKU (reopening My Listings each time).
 5. Each row's **Status** column turns green (OK), orange (CHECK = please verify in the browser) or red (FAILED).
    A screenshot of every problem is saved in the `logs` folder next to the app
    (`bin\Debug\net8.0-windows\logs` when run from Visual Studio). Chrome and your tabs stay open.
