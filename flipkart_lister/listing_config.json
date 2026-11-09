@@ -1,0 +1,68 @@
+{
+  "seller_hub_url": "https://seller.flipkart.com/",
+  "vertical": "Roti Cover",
+  "brand": "Trusha Enterprise",
+  "sku_prefix": "3X ROTI COVER P",
+  "last_used_sku_number": 3,
+
+  "price_stock_shipping": {
+    "Listing Status": "Active",
+    "MRP": "599",
+    "Your selling price": "299",
+    "Minimum Order Quantity": "1",
+    "Fulfilment by": "Seller",
+    "Procurement type": "instock",
+    "Procurement SLA": "2",
+    "Stock": "1000",
+    "Shipping provider": "Flipkart",
+    "Length": "4",
+    "Breadth": "4",
+    "Height": "4",
+    "Weight": "0.15",
+    "HSN": "6302",
+    "Luxury Cess": "0",
+    "Tax Code": "GST_APPAREL",
+    "Country Of Origin": "India",
+    "Manufacturer Details": "TRUSHA ENTERPRISE",
+    "Packer Details": "TRUSHA ENTERPRISE"
+  },
+
+  "product_description": {
+    "Model Number": "TE-ROTICOVER-{sku_number}",
+    "Brand Color": "Cream",
+    "Color": "Beige",
+    "Type": "Flap Cover",
+    "Material": "Cotton Cloth",
+    "Shape": "Square",
+    "Pattern": "Solid",
+    "Insulated Interior": "No",
+    "Number of Flaps": "4",
+    "Wash Instructions": "Machine wash cold, Do not bleach",
+    "Wall Thickness": "0.2",
+    "Diameter": "23",
+    "Width": "23",
+    "Weight": "183",
+    "Number of Covers": "3",
+    "Items Included": "3 roti covers"
+  },
+
+  "additional_description": {
+    "Model Name": "Cotton Chapati Cloth Cover",
+    "Pack of": "3",
+    "Key Features": [
+      "100% Pure Cotton",
+      "Thick Double Layer",
+      "4 Flaps Wrap Design",
+      "Keeps Rotis Soft and Warm",
+      "Reusable and Machine Washable"
+    ],
+    "Search Keywords": [
+      "roti cover", "roti cover cloth", "roti kapda", "roti rumal", "roti napkin",
+      "roti wrapper", "roti warmer", "chapati cover", "chapati cloth", "chapati cover cotton",
+      "chapati cloth cover", "chapati wrap", "chapati basket cloth", "cotton roti cover",
+      "cotton roti cloth", "bread cover cloth", "tortilla warmer cloth", "roti cover pack of 3",
+      "kitchen cotton napkin"
+    ],
+    "Description": "description.txt"
+  }
+}
