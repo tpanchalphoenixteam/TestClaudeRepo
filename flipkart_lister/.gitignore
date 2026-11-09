@@ -1,6 +1,0 @@
-browser_profile/
-__pycache__/
-_converted/
-images/*
-!images/README.txt
-logs/
