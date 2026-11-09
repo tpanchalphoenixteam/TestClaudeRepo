@@ -44,31 +44,43 @@ public sealed class SellerHub : IAsyncDisposable
     public int DebugPort { get; init; } = 9222;
     public string TabUrlContains { get; init; } = "seller.flipkart.com";
 
-    /// <summary>Chrome profile used for the "Chrome for Flipkart" window (login is remembered here).</summary>
-    public static string ChromeProfileDir => Path.Combine(
-        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "FlipkartPriceUpdater", "ChromeProfile");
-
     IPage Page => _page ?? throw new InvalidOperationException("Call StartAsync or AttachToOpenChromeAsync first");
     IBrowser? _attachedBrowser;
     bool Attached => _attachedBrowser is not null;
 
+    /// <summary>Chrome profile folders whose DevToolsActivePort file is checked (your normal Chrome first).</summary>
+    public IReadOnlyList<string> ChromeUserDataDirs { get; init; } = new[]
+    {
+        Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Google", "Chrome", "User Data"),
+    };
+
     // ------------------------------------------------------------------ attach to the user's open Chrome
     /// <summary>
-    /// Connects to a Chrome window started with --remote-debugging-port (see <see cref="LaunchChromeForFlipkart"/>)
-    /// and picks the tab that already has Seller Hub open. Returns false if no such Chrome is running.
+    /// Connects to your already-running Chrome and picks the tab that already has Seller Hub open.
+    /// Works with your normal Chrome once "Allow remote debugging" is switched on at
+    /// chrome://inspect/#remote-debugging (Chrome 144+; Chrome asks you to Allow each connection),
+    /// or with a Chrome started with --remote-debugging-port=9222. Returns false if neither is available.
     /// </summary>
     public async Task<bool> AttachToOpenChromeAsync()
     {
         _playwright ??= await Playwright.CreateAsync();
-        try
+        foreach (var endpoint in CandidateEndpoints())
         {
-            _attachedBrowser = await _playwright.Chromium.ConnectOverCDPAsync(
-                $"http://127.0.0.1:{DebugPort}", new() { Timeout = 5000 });
+            var isWs = endpoint.StartsWith("ws://", StringComparison.Ordinal);
+            try
+            {
+                if (isWs) _log("Connecting to your Chrome - if Chrome asks to allow remote debugging, click Allow.");
+                // Long timeout for the WebSocket: Chrome waits for you to click Allow.
+                _attachedBrowser = await _playwright.Chromium.ConnectOverCDPAsync(
+                    endpoint, new() { Timeout = isWs ? 90_000 : 5_000 });
+                break;
+            }
+            catch (Exception)
+            {
+                _attachedBrowser = null;   // stale port file / Chrome not listening / not allowed - try the next one
+            }
         }
-        catch (Exception)
-        {
-            return false;
-        }
+        if (_attachedBrowser is null) return false;
 
         var tabs = _attachedBrowser.Contexts.SelectMany(c => c.Pages).ToList();
         _page = tabs.FirstOrDefault(p => p.Url.Contains(TabUrlContains, StringComparison.OrdinalIgnoreCase));
@@ -88,15 +100,43 @@ public sealed class SellerHub : IAsyncDisposable
         return true;
     }
 
-    /// <summary>Starts Chrome with a dedicated profile and the debugging port, opening Seller Hub.</summary>
-    public static void LaunchChromeForFlipkart(int port = 9222)
+    /// <summary>
+    /// Chrome writes "port\n/devtools/browser/&lt;id&gt;" to DevToolsActivePort while remote debugging is on.
+    /// In the chrome://inspect toggle mode only that WebSocket path works (http://host:port/json returns 404).
+    /// </summary>
+    IEnumerable<string> CandidateEndpoints()
+    {
+        var seen = new HashSet<string>();
+        foreach (var dir in ChromeUserDataDirs)
+        {
+            string[] lines;
+            try
+            {
+                using var fs = new FileStream(Path.Combine(dir, "DevToolsActivePort"), FileMode.Open, FileAccess.Read,
+                                              FileShare.ReadWrite | FileShare.Delete);
+                using var reader = new StreamReader(fs);
+                lines = reader.ReadToEnd().Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+            }
+            catch (IOException) { continue; }
+            catch (UnauthorizedAccessException) { continue; }
+
+            if (lines.Length >= 2 && int.TryParse(lines[0], out var port) && lines[1].StartsWith('/'))
+            {
+                var ws = $"ws://127.0.0.1:{port}{lines[1]}";
+                if (seen.Add(ws)) yield return ws;
+            }
+        }
+        yield return $"http://127.0.0.1:{DebugPort}";
+    }
+
+    /// <summary>Opens chrome://inspect/#remote-debugging in your Chrome (one-time setup page).</summary>
+    public static void OpenRemoteDebuggingSettings()
     {
         var exe = FindChromeExe() ?? throw new FileNotFoundException("Google Chrome is not installed (chrome.exe not found).");
-        Directory.CreateDirectory(ChromeProfileDir);
         System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo
         {
             FileName = exe,
-            Arguments = $"--remote-debugging-port={port} --user-data-dir=\"{ChromeProfileDir}\" --no-first-run {SellerHubUrl}",
+            Arguments = "chrome://inspect/#remote-debugging",
             UseShellExecute = false,
         });
     }
@@ -184,7 +224,7 @@ public sealed class SellerHub : IAsyncDisposable
         {
             await ClickTextAsync("My Listings", "Manage Listings", "Active Listings", "Listings Management");
             await Page.WaitForTimeoutAsync(2500);
-            if (await FindSkuSearchAsync() is { } box) return box;
+            if (await FindSkuSearchAsync() is { } box) return Remember(box);
         }
 
         // 2) known direct links
@@ -192,13 +232,21 @@ public sealed class SellerHub : IAsyncDisposable
         {
             await Page.GotoAsync(url, new() { WaitUntil = WaitUntilState.DOMContentLoaded });
             await Page.WaitForTimeoutAsync(3000);
-            if (await FindSkuSearchAsync() is { } box2) return box2;
+            if (await FindSkuSearchAsync() is { } box2) return Remember(box2);
         }
 
         // 3) ask the user
         await _askUser("I couldn't open My Listings automatically.\n\n" +
                        "In the Flipkart tab, click Listings -> My Listings (the page with the SKU search box), then click OK here.");
-        return await FindSkuSearchAsync() ?? throw new InvalidOperationException("SKU search box not found on this page");
+        return Remember(await FindSkuSearchAsync() ?? throw new InvalidOperationException("SKU search box not found on this page"));
+    }
+
+    string? _listingsUrl;
+
+    ILocator Remember(ILocator searchBox)
+    {
+        _listingsUrl = Page.Url;
+        return searchBox;
     }
 
     // ------------------------------------------------------------------ price update
@@ -229,7 +277,9 @@ public sealed class SellerHub : IAsyncDisposable
 
     async Task<string> UpdateCoreAsync(PriceChange c)
     {
-        var search = await FindSkuSearchAsync() ?? await OpenListingsPageAsync();
+        // Only reuse the search box if we're still on My Listings (the home page has a different "Search LID" box).
+        var search = Page.Url == _listingsUrl ? await FindSkuSearchAsync() : null;
+        search ??= await OpenListingsPageAsync();
         await search.FillAsync("");
         await search.FillAsync(c.Sku);
         await search.PressAsync("Enter");

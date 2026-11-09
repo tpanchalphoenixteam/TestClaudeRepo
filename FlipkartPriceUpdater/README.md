@@ -25,35 +25,34 @@ dotnet publish -c Release -r win-x64 --self-contained -p:PublishSingleFile=true 
 Then run `publish\FlipkartPriceUpdater.exe`.
 
 ## Using it
-The app works in **your open Chrome window** that is already logged in to Seller Hub.
+The app works in **the Chrome you already use**, on the Flipkart Seller Hub tab that is already logged in.
+It does not open a new browser and you don't log in again.
 
-**First time only**
-1. Click **Start Chrome for Flipkart** in the app (or double-click `Start-Chrome-For-Flipkart.bat`).
-   A Chrome window opens on Seller Hub. **Log in there.** The login is remembered for next time.
-2. Keep that Chrome window open. Use it for Flipkart as you normally would.
-
-> Why a separate Chrome window? Since version 136 (2025), Chrome doesn't let any program control your normal
-> everyday profile. This dedicated Flipkart window is the only kind of Chrome window the app is allowed to connect to.
+**One-time setup (Chrome 144 or newer)**
+1. Click **Connect my Chrome (one-time setup)** in the app, or open `chrome://inspect/#remote-debugging` in Chrome yourself.
+2. Turn ON **"Allow remote debugging for this browser instance"**.
 
 **Every time**
-1. Fill the grid: **SKU ID**, **Selling Price**, optional **MRP**. Or copy the columns from Excel and press **Ctrl+V** in the grid.
-2. Leave **Use my open Chrome (Flipkart tab)** ticked and click **OK - Update Prices**.
-3. The app finds your Seller Hub tab, then for each SKU goes **Listings → My Listings**, searches the SKU ID,
-   changes the price and clicks Save. If the Flipkart Chrome window isn't open, it starts it for you.
-4. Each row's **Status** column turns green (OK), orange (CHECK = please verify in the browser) or red (FAILED).
+1. Have Seller Hub open in Chrome as usual.
+2. Fill the grid: **SKU ID**, **Selling Price**, optional **MRP**. Or copy the columns from Excel and press **Ctrl+V** in the grid.
+3. Click **OK - Update Prices**. **Chrome asks to allow the connection: click Allow.**
+4. The app finds your Seller Hub tab and, for each SKU, goes **Listings → My Listings**, searches the SKU ID,
+   changes the price and clicks Save.
+5. Each row's **Status** column turns green (OK), orange (CHECK = please verify in the browser) or red (FAILED).
    A screenshot of every problem is saved in the `logs` folder next to the app
-   (`bin\Debug\net8.0-windows\logs` when run from Visual Studio). Your Chrome window stays open afterwards.
+   (`bin\Debug\net8.0-windows\logs` when run from Visual Studio). Chrome and your tabs stay open.
 
 Before anything runs, the app checks: prices are numbers, selling price ≤ MRP, no duplicate SKUs.
 
-Untick **Use my open Chrome** to use the old mode instead, where the app opens its own browser.
+How it connects: while the setting is on, Chrome writes its connection address to
+`%LOCALAPPDATA%\Google\Chrome\User Data\DevToolsActivePort`, and the app connects there with Microsoft.Playwright.
+You can turn the setting off again at the same `chrome://inspect` page.
 
 ## Files
 | File | Purpose |
 |---|---|
 | `MainForm.cs` | The window (grid, Excel paste, OK button, status colours, log) |
 | `SellerHub.cs` | Browser automation with Microsoft.Playwright (login, find SKU, set price, save) |
-| `Start-Chrome-For-Flipkart.bat` | Opens the Flipkart Chrome window the app connects to (same as the button) |
 | `PriceParser.cs` | Input validation and Excel/CSV paste parsing |
 
 Flipkart changes its Seller Hub screens often, so fields are found by their on-screen labels. If a step keeps failing,

@@ -9,7 +9,7 @@ public sealed class MainForm : Form
     readonly TextBox _log = new();
     readonly Button _ok = new() { Text = "OK - Update Prices", AutoSize = true, Padding = new Padding(10, 4, 10, 4) };
     readonly Button _clear = new() { Text = "Clear", AutoSize = true, Padding = new Padding(10, 4, 10, 4) };
-    readonly Button _startChrome = new() { Text = "Start Chrome for Flipkart", AutoSize = true, Padding = new Padding(10, 4, 10, 4) };
+    readonly Button _setup = new() { Text = "Connect my Chrome (one-time setup)", AutoSize = true, Padding = new Padding(10, 4, 10, 4) };
     readonly CheckBox _attach = new() { Text = "Use my open Chrome (Flipkart tab)", Checked = true, AutoSize = true };
     bool _running;
 
@@ -51,9 +51,9 @@ public sealed class MainForm : Form
         _log.Font = new Font("Consolas", 9f);
 
         var buttons = new FlowLayoutPanel { Dock = DockStyle.Fill, FlowDirection = FlowDirection.RightToLeft, AutoSize = true };
-        buttons.Controls.AddRange(new Control[] { _ok, _clear, _startChrome, _attach });
+        buttons.Controls.AddRange(new Control[] { _ok, _clear, _setup, _attach });
         _attach.Margin = new Padding(3, 8, 20, 3);
-        _startChrome.Click += (_, _) => StartChrome();
+        _setup.Click += (_, _) => OpenChromeSetup();
         _ok.Click += OnOkClick;
         _clear.Click += (_, _) => { if (!_running) _grid.Rows.Clear(); };
         AcceptButton = null; // Enter moves between grid cells instead of submitting
@@ -134,20 +134,21 @@ public sealed class MainForm : Form
             if (_attach.Checked)
             {
                 Log("Looking for your open Chrome / Flipkart tab...");
-                if (!await hub.AttachToOpenChromeAsync())
+                while (!await hub.AttachToOpenChromeAsync())
                 {
-                    Log("Chrome for Flipkart is not open - starting it.");
-                    if (!StartChrome()) return;
-                    await AskUserAsync("A Chrome window for Flipkart has opened.\n\n" +
-                                       "Log in to Seller Hub there if it asks (only the first time - it is remembered), " +
-                                       "then click OK here.\n\nTip: keep this Chrome window open for next time.");
-                    var attached = false;
-                    for (var i = 0; i < 5 && !attached; i++)
-                    {
-                        attached = await hub.AttachToOpenChromeAsync();
-                        if (!attached) await Task.Delay(1500);
-                    }
-                    if (!attached) throw new InvalidOperationException("Couldn't connect to the Chrome for Flipkart window.");
+                    Log("Couldn't connect to your Chrome.");
+                    var answer = MessageBox.Show(this,
+                        "I couldn't connect to your open Chrome.\n\n" +
+                        "One-time setup (Chrome 144 or newer):\n" +
+                        "  1. In Chrome, open:  chrome://inspect/#remote-debugging\n" +
+                        "  2. Turn ON \"Allow remote debugging for this browser instance\".\n" +
+                        "  3. When Chrome asks to allow the connection, click Allow.\n\n" +
+                        "Yes = I've done it, try again\n" +
+                        "No = open that Chrome settings page for me\n" +
+                        "Cancel = stop",
+                        "Connect to your Chrome", MessageBoxButtons.YesNoCancel, MessageBoxIcon.Information);
+                    if (answer == DialogResult.Cancel) return;
+                    if (answer == DialogResult.No) OpenChromeSetup();
                 }
             }
             else
@@ -193,19 +194,19 @@ public sealed class MainForm : Form
         return Task.CompletedTask;
     }
 
-    bool StartChrome()
+    void OpenChromeSetup()
     {
-        try
-        {
-            SellerHub.LaunchChromeForFlipkart();
-            Log("Started Chrome for Flipkart. Log in there once and keep that window open.");
-            return true;
-        }
-        catch (Exception ex)
-        {
-            MessageBox.Show(this, ex.Message, "Couldn't start Chrome", MessageBoxButtons.OK, MessageBoxIcon.Error);
-            return false;
-        }
+        try { SellerHub.OpenRemoteDebuggingSettings(); }
+        catch (Exception ex) { Log("Couldn't open Chrome: " + ex.Message); }
+        MessageBox.Show(this,
+            "In your Chrome (where Flipkart Seller Hub is already open):\n\n" +
+            "  1. Go to the tab  chrome://inspect/#remote-debugging\n" +
+            "     (it should have just opened; if not, type it in the address bar)\n" +
+            "  2. Turn ON \"Allow remote debugging for this browser instance\".\n\n" +
+            "That's it - you only do this once. When you click OK - Update Prices,\n" +
+            "Chrome will ask to allow the connection: click Allow.\n\n" +
+            "Needs Chrome 144 or newer (Chrome menu > Help > About Google Chrome).",
+            "Connect my Chrome - one-time setup", MessageBoxButtons.OK, MessageBoxIcon.Information);
     }
 
     static string? Cell(DataGridViewRow r, int col) => r.Cells[col].Value?.ToString();
@@ -220,7 +221,7 @@ public sealed class MainForm : Form
     void SetRunning(bool running)
     {
         _running = running;
-        _ok.Enabled = _clear.Enabled = _attach.Enabled = _startChrome.Enabled = !running;
+        _ok.Enabled = _clear.Enabled = _attach.Enabled = _setup.Enabled = !running;
         _grid.ReadOnly = running;
         _grid.AllowUserToAddRows = !running;
         UseWaitCursor = running;
