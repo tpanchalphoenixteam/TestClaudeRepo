@@ -9,7 +9,8 @@ public sealed class MainForm : Form
     readonly TextBox _log = new();
     readonly Button _ok = new() { Text = "OK - Update Prices", AutoSize = true, Padding = new Padding(10, 4, 10, 4) };
     readonly Button _clear = new() { Text = "Clear", AutoSize = true, Padding = new Padding(10, 4, 10, 4) };
-    readonly CheckBox _useChrome = new() { Text = "Use my installed Google Chrome", Checked = true, AutoSize = true };
+    readonly Button _startChrome = new() { Text = "Start Chrome for Flipkart", AutoSize = true, Padding = new Padding(10, 4, 10, 4) };
+    readonly CheckBox _attach = new() { Text = "Use my open Chrome (Flipkart tab)", Checked = true, AutoSize = true };
     bool _running;
 
     public MainForm()
@@ -50,8 +51,9 @@ public sealed class MainForm : Form
         _log.Font = new Font("Consolas", 9f);
 
         var buttons = new FlowLayoutPanel { Dock = DockStyle.Fill, FlowDirection = FlowDirection.RightToLeft, AutoSize = true };
-        buttons.Controls.AddRange(new Control[] { _ok, _clear, _useChrome });
-        _useChrome.Margin = new Padding(3, 8, 20, 3);
+        buttons.Controls.AddRange(new Control[] { _ok, _clear, _startChrome, _attach });
+        _attach.Margin = new Padding(3, 8, 20, 3);
+        _startChrome.Click += (_, _) => StartChrome();
         _ok.Click += OnOkClick;
         _clear.Click += (_, _) => { if (!_running) _grid.Rows.Clear(); };
         AcceptButton = null; // Enter moves between grid cells instead of submitting
@@ -129,8 +131,30 @@ public sealed class MainForm : Form
         try
         {
             await using var hub = new SellerHub(AskUserAsync, Log);
-            Log("Starting browser...");
-            await hub.StartAsync(_useChrome.Checked);
+            if (_attach.Checked)
+            {
+                Log("Looking for your open Chrome / Flipkart tab...");
+                if (!await hub.AttachToOpenChromeAsync())
+                {
+                    Log("Chrome for Flipkart is not open - starting it.");
+                    if (!StartChrome()) return;
+                    await AskUserAsync("A Chrome window for Flipkart has opened.\n\n" +
+                                       "Log in to Seller Hub there if it asks (only the first time - it is remembered), " +
+                                       "then click OK here.\n\nTip: keep this Chrome window open for next time.");
+                    var attached = false;
+                    for (var i = 0; i < 5 && !attached; i++)
+                    {
+                        attached = await hub.AttachToOpenChromeAsync();
+                        if (!attached) await Task.Delay(1500);
+                    }
+                    if (!attached) throw new InvalidOperationException("Couldn't connect to the Chrome for Flipkart window.");
+                }
+            }
+            else
+            {
+                Log("Starting a separate browser...");
+                await hub.StartAsync();
+            }
             await hub.EnsureLoggedInAsync();
             await hub.OpenListingsPageAsync();
 
@@ -149,7 +173,7 @@ public sealed class MainForm : Form
             MessageBox.Show(this,
                 $"Updated {ok} of {changes.Count} SKU(s).\n\n" +
                 string.Join("\n", changes.Select(c => $"{c.Sku}: {c.Status}")) +
-                "\n\nCheck the browser if needed. Click OK to close the browser.",
+                (_attach.Checked ? "\n\nYour Chrome window stays open." : "\n\nCheck the browser if needed. Click OK to close the browser."),
                 "Done", MessageBoxButtons.OK, ok == changes.Count ? MessageBoxIcon.Information : MessageBoxIcon.Warning);
         }
         catch (Exception ex)
@@ -169,6 +193,21 @@ public sealed class MainForm : Form
         return Task.CompletedTask;
     }
 
+    bool StartChrome()
+    {
+        try
+        {
+            SellerHub.LaunchChromeForFlipkart();
+            Log("Started Chrome for Flipkart. Log in there once and keep that window open.");
+            return true;
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show(this, ex.Message, "Couldn't start Chrome", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            return false;
+        }
+    }
+
     static string? Cell(DataGridViewRow r, int col) => r.Cells[col].Value?.ToString();
 
     void SetStatus(PriceChange c, string text, Color color)
@@ -181,7 +220,7 @@ public sealed class MainForm : Form
     void SetRunning(bool running)
     {
         _running = running;
-        _ok.Enabled = _clear.Enabled = _useChrome.Enabled = !running;
+        _ok.Enabled = _clear.Enabled = _attach.Enabled = _startChrome.Enabled = !running;
         _grid.ReadOnly = running;
         _grid.AllowUserToAddRows = !running;
         UseWaitCursor = running;

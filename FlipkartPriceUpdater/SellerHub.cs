@@ -41,10 +41,80 @@ public sealed class SellerHub : IAsyncDisposable
     public string LogDir { get; init; } = Path.Combine(AppContext.BaseDirectory, "logs");
     public string? ExecutablePath { get; init; }   // for testing with a specific browser
     public bool Headless { get; init; }
+    public int DebugPort { get; init; } = 9222;
+    public string TabUrlContains { get; init; } = "seller.flipkart.com";
 
-    IPage Page => _page ?? throw new InvalidOperationException("Call StartAsync first");
+    /// <summary>Chrome profile used for the "Chrome for Flipkart" window (login is remembered here).</summary>
+    public static string ChromeProfileDir => Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "FlipkartPriceUpdater", "ChromeProfile");
 
-    // ------------------------------------------------------------------ browser
+    IPage Page => _page ?? throw new InvalidOperationException("Call StartAsync or AttachToOpenChromeAsync first");
+    IBrowser? _attachedBrowser;
+    bool Attached => _attachedBrowser is not null;
+
+    // ------------------------------------------------------------------ attach to the user's open Chrome
+    /// <summary>
+    /// Connects to a Chrome window started with --remote-debugging-port (see <see cref="LaunchChromeForFlipkart"/>)
+    /// and picks the tab that already has Seller Hub open. Returns false if no such Chrome is running.
+    /// </summary>
+    public async Task<bool> AttachToOpenChromeAsync()
+    {
+        _playwright ??= await Playwright.CreateAsync();
+        try
+        {
+            _attachedBrowser = await _playwright.Chromium.ConnectOverCDPAsync(
+                $"http://127.0.0.1:{DebugPort}", new() { Timeout = 5000 });
+        }
+        catch (Exception)
+        {
+            return false;
+        }
+
+        var tabs = _attachedBrowser.Contexts.SelectMany(c => c.Pages).ToList();
+        _page = tabs.FirstOrDefault(p => p.Url.Contains(TabUrlContains, StringComparison.OrdinalIgnoreCase));
+        if (_page is null)
+        {
+            var ctx = _attachedBrowser.Contexts.FirstOrDefault() ?? await _attachedBrowser.NewContextAsync();
+            _page = await ctx.NewPageAsync();
+            _log("No Flipkart tab was open - opening Seller Hub in a new tab.");
+            await _page.GotoAsync(SellerHubUrl, new() { WaitUntil = WaitUntilState.DOMContentLoaded });
+        }
+        else
+        {
+            _log($"Using your open Flipkart tab: {_page.Url}");
+        }
+        await _page.BringToFrontAsync();
+        _page.SetDefaultTimeout(15_000);
+        return true;
+    }
+
+    /// <summary>Starts Chrome with a dedicated profile and the debugging port, opening Seller Hub.</summary>
+    public static void LaunchChromeForFlipkart(int port = 9222)
+    {
+        var exe = FindChromeExe() ?? throw new FileNotFoundException("Google Chrome is not installed (chrome.exe not found).");
+        Directory.CreateDirectory(ChromeProfileDir);
+        System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo
+        {
+            FileName = exe,
+            Arguments = $"--remote-debugging-port={port} --user-data-dir=\"{ChromeProfileDir}\" --no-first-run {SellerHubUrl}",
+            UseShellExecute = false,
+        });
+    }
+
+    static string? FindChromeExe()
+    {
+        string[] roots =
+        {
+            Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles),
+            Environment.GetFolderPath(Environment.SpecialFolder.ProgramFilesX86),
+            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+        };
+        return roots.Where(r => r.Length > 0)
+                    .Select(r => Path.Combine(r, "Google", "Chrome", "Application", "chrome.exe"))
+                    .FirstOrDefault(File.Exists);
+    }
+
+    // ------------------------------------------------------------------ separate browser (old mode)
     public async Task StartAsync(bool preferInstalledChrome = true)
     {
         _playwright = await Playwright.CreateAsync();
@@ -90,8 +160,12 @@ public sealed class SellerHub : IAsyncDisposable
 
     public async Task EnsureLoggedInAsync()
     {
-        await Page.GotoAsync(SellerHubUrl, new() { WaitUntil = WaitUntilState.DOMContentLoaded });
-        await Page.WaitForTimeoutAsync(3000);
+        // When attached to the user's Flipkart tab, stay on it instead of reloading.
+        if (!Attached || !Page.Url.Contains(TabUrlContains, StringComparison.OrdinalIgnoreCase))
+        {
+            await Page.GotoAsync(SellerHubUrl, new() { WaitUntil = WaitUntilState.DOMContentLoaded });
+            await Page.WaitForTimeoutAsync(3000);
+        }
         var loginBox = await FirstVisibleAsync(Page.GetByPlaceholder(new Regex("password|mobile|email|username", I)));
         if (Page.Url.Contains("login", StringComparison.OrdinalIgnoreCase) || loginBox is not null)
         {
@@ -104,21 +178,26 @@ public sealed class SellerHub : IAsyncDisposable
 
     public async Task<ILocator> OpenListingsPageAsync()
     {
-        _log("Opening Manage Listings...");
+        // 1) the way you'd do it by hand: Listings -> My Listings
+        _log("Opening Listings -> My Listings...");
+        if (await ClickTextAsync("Listings"))
+        {
+            await ClickTextAsync("My Listings", "Manage Listings", "Active Listings", "Listings Management");
+            await Page.WaitForTimeoutAsync(2500);
+            if (await FindSkuSearchAsync() is { } box) return box;
+        }
+
+        // 2) known direct links
         foreach (var url in ListingPages)
         {
             await Page.GotoAsync(url, new() { WaitUntil = WaitUntilState.DOMContentLoaded });
             await Page.WaitForTimeoutAsync(3000);
-            if (await FindSkuSearchAsync() is { } box) return box;
+            if (await FindSkuSearchAsync() is { } box2) return box2;
         }
 
-        await ClickTextAsync("Listings");
-        await ClickTextAsync("Manage Listings", "Active Listings", "My Listings", "Listings Management");
-        await Page.WaitForTimeoutAsync(2500);
-        if (await FindSkuSearchAsync() is { } box2) return box2;
-
-        await _askUser("I couldn't open the listings page automatically.\n\n" +
-                       "In the browser, open Listings -> Manage / Active Listings (the page with the SKU search box), then click OK.");
+        // 3) ask the user
+        await _askUser("I couldn't open My Listings automatically.\n\n" +
+                       "In the Flipkart tab, click Listings -> My Listings (the page with the SKU search box), then click OK here.");
         return await FindSkuSearchAsync() ?? throw new InvalidOperationException("SKU search box not found on this page");
     }
 
@@ -345,7 +424,8 @@ public sealed class SellerHub : IAsyncDisposable
 
     public async ValueTask DisposeAsync()
     {
-        if (_context is not null) await _context.CloseAsync();
+        // Attached mode: just disconnect - your Chrome window and Flipkart tab stay open.
+        if (_context is not null && !Attached) await _context.CloseAsync();
         _playwright?.Dispose();
     }
 }
