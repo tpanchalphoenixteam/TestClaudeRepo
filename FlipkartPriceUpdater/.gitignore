@@ -1,0 +1,6 @@
+bin/
+obj/
+browser_profile/
+logs/
+*.user
+.vs/
